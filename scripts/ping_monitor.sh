@@ -56,17 +56,23 @@ SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------------------------------------------------------
 # Logging
+# 	Usage: log <level> <message>
 # ----------------------------------------------------------------------------
 log() {
-    local level="$1"
+
+	# params
+	local level="$1"
     local message="$2"
+
+	# Log Levels (Low Priority <=> High Priority)
     local levels=("DEBUG" "INFO" "WARN" "ERROR")
     local current_idx=1   # default: INFO
 
     # Resolve numeric index for the configured log level
-    for i in "${!levels[@]}"; do
+    for i in "${!levels[@]}"; do	# ${!levels[@]} return (0 1 2 3)
         [[ "${levels[$i]}" == "$LOG_LEVEL" ]] && current_idx=$i
     done
+
     for i in "${!levels[@]}"; do
         if [[ "${levels[$i]}" == "$level" && $i -ge $current_idx ]]; then
             printf "[%s] [%s] [%s] %s\n" \
@@ -77,10 +83,59 @@ log() {
 }
 
 # ----------------------------------------------------------------------------
+# DEPENDENCY CHECK
+# ----------------------------------------------------------------------------
+check_dependencies() {
+	local dependencies=("ping", "awk", "psql")
+
+	for dependency in "${dependencies[@]}"; do
+
+		# check dependency is installed
+		if ! command -v "$dependency" &>/dev/null; then
+			log "ERROR" "Required dependency not found: ${dependency}"
+			exit 1
+		fi
+	done
+	log "INFO" "Dependency check PASSED"
+}
+
+# ----------------------------------------------------------------------------
+# ARGUMENT PARSING
+# 	case <..> in
+#		<condition>)
+#			<statement>; shift ;;
+#		*)
+#
+#	shift	shift args
+#	*) 		wildcard
+# ----------------------------------------------------------------------------
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--target)
+				PING_TARGETS="$2"; shift 2 ;; 
+			--count)
+				PING_COUNT="$2"; shift 2 ;; 
+			--interval)
+				PING_INTERVAL="$2"; shift 2 ;;
+			--count)
+				RUN_MODE="once"; shift ;;
+			*)
+				log "ERROR" "Unknown Argument: $1"
+				exit 2 ;;
+		esac
+	done
+}
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 main() {
-    log "INFO" "TEST MESSAGE"
+    log "INFO" "TEST INFO MESSAGE"
+	log "WARN" "TEST WARN MESSAGE"
+	log "DEBUG" "TEST MESSAGE"
+	log "ERROR" "TEST MESSAGE"
+	log "ERROR" "TEST MESSAGE"
 }
 
 main "$@"
