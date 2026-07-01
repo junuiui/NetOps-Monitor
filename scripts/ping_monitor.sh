@@ -1,40 +1,50 @@
-#!/bin/bash
-# ===========================================================================
+#!/usr/bin/env bash
+# =============================================================================
 # ping_monitor.sh
-# 
+#
 # Purpose:
-#   Periodically pings one or more configured targets, measures
-#       1. round-trip latency (min/avg/max) and
-#       2. packet loss percentage
-#   writes results to a PostgreSQL table for downstream analytics and alerting
+#   Periodically pings one or more configured targets, measures round-trip
+#   latency (min/avg/max) and packet loss percentage, then writes the results
+#   to a PostgreSQL table for downstream analytics and alerting.
 #
 # Usage:
 #   ./ping_monitor.sh [--target <host>] [--count <n>] [--interval <seconds>]
 #
-#   All flags are optional. Values fall back to environment variables or the hard-coded defaults defined in the CONFIGURATION section below
+#   All flags are optional; values fall back to environment variables or the
+#   hard-coded defaults defined in the CONFIGURATION section below.
 #
 # Environment Variables (override defaults without editing this file):
-#   PING_TARGETS    space-separated list of hosts/IPs to ping
-#                   Example: "8.8.8.8 123.1.2.122 example.com"
+#   PING_TARGETS      Space-separated list of hosts/IPs to ping.
+#                     Example: "8.8.8.8 1.1.1.1 example.com"
+#   PING_COUNT        Number of ICMP packets sent per probe cycle. Default: 5
+#   PING_INTERVAL     Seconds between probe cycles. Default: 60
+#   DB_HOST           PostgreSQL host.           Default: localhost
+#   DB_PORT           PostgreSQL port.           Default: 5432
+#   DB_NAME           PostgreSQL database name.  Default: netops
+#   DB_USER           PostgreSQL user.           Default: netops_user
+#   DB_PASSWORD       PostgreSQL password.       (no default; must be set)
+#   LOG_DIR           Directory for log files.   Default: /var/log/netops
+#   LOG_LEVEL         INFO | WARN | ERROR        Default: INFO
 #
-#   PING_COUNT      Number of ICMP packets sent per probe cycle. Default: 5
-#   PING_INTERVAL   Seconds between probe cycles. Default: 60
-#   RUN_MODE        loop | once             Default: loop
-#   DB_HOST         Default: localhost
-#   DB_PORT         Default: 5432
-#   DB_NAME         Default: netops
-#   DB_USER         Default: netops_user
-#   DB_PASSWORD     No Default, Must be set
-#   LOG_DIR         Directory for log files Default: /var/log/netops
-#   LOG_LEVEL       INFO | WARN | ERROR     Default: INFO
-#   
+# Dependencies:
+#   ping, awk, psql (postgresql-client)
+#
 # Exit Codes:
-#   0   Normal exit (SIGTERM / SIGINT)
-#   1   Missing required dependency
-#   2   Invalid Arguments
-#   3   Database Connection failure on startup
+#   0  Normal exit (SIGTERM / SIGINT received)
+#   1  Missing required dependency
+#   2  Invalid argument
+#   3  Database connection failure on startup
 #
-# ===========================================================================
+# Cron Example (run every minute, managed externally):
+#   * * * * * /opt/netops/scripts/ping_monitor.sh >> /var/log/netops/ping.log 2>&1
+#
+# Notes:
+#   - Designed to run as a long-lived process (infinite loop) or as a
+#     one-shot cron job depending on RUN_MODE (see CONFIGURATION).
+#   - SIGTERM and SIGINT are trapped for graceful shutdown.
+#   - All database writes use a single INSERT per probe cycle to minimise
+#     connection overhead.
+# =============================================================================
 
 # Immediate fail
 # -e                if any command fails, then exit all script
@@ -42,9 +52,9 @@
 # -o pipefail       if any error during pipelining, exit all pipelines
 set -euo pipefail
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CONFIGURATION — defaults (overridden by env vars or CLI flags)
+# ---------------------------------------------------------------------------
 PING_TARGETS="${PING_TARGETS:-"8.8.8.8 1.1.1.1"}"
 PING_COUNT="${PING_COUNT:-5}"
 PING_INTERVAL="${PING_INTERVAL:-60}"       # seconds between cycles
@@ -60,25 +70,21 @@ LOG_DIR="${LOG_DIR:-/var/log/netops}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 SCRIPT_NAME="$(basename "$0")"
 
-# ----------------------------------------------------------------------------
-# Logging
-# 	Usage: log <level> <message>
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+# log <level> <message>
+#   Writes a timestamped log line to stdout; respects LOG_LEVEL hierarchy.
 log() {
-
-	# params
-	local level="$1"
+    local level="$1"
     local message="$2"
-
-	# Log Levels (Low Priority <=> High Priority)
     local levels=("DEBUG" "INFO" "WARN" "ERROR")
     local current_idx=1   # default: INFO
 
     # Resolve numeric index for the configured log level
-    for i in "${!levels[@]}"; do	# ${!levels[@]} return (0 1 2 3)
+    for i in "${!levels[@]}"; do
         [[ "${levels[$i]}" == "$LOG_LEVEL" ]] && current_idx=$i
     done
-
     for i in "${!levels[@]}"; do
         if [[ "${levels[$i]}" == "$level" && $i -ge $current_idx ]]; then
             printf "[%s] [%s] [%s] %s\n" \
@@ -88,108 +94,151 @@ log() {
     done
 }
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # DEPENDENCY CHECK
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 check_dependencies() {
-	local dependencies=("ping" "awk" "psql")
-
-	for dependency in "${dependencies[@]}"; do
-
-		# check dependency is installed
-		if ! command -v "$dependency" &>/dev/null; then
-			log "ERROR" "Required dependency not found: ${dependency}"
-			exit 1
-		fi
-	done
-	log "INFO" "Dependency check PASSED"
+    local deps=("ping" "awk" "psql")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            log "ERROR" "Required dependency not found: ${dep}"
+            exit 1
+        fi
+    done
+    log "INFO" "Dependency check passed."
 }
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # ARGUMENT PARSING
-# 	case <..> in
-#		<condition>)
-#			<statement>; shift ;;
-#		*)
-#
-#	shift	shift args
-#	*) 		wildcard
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 parse_args() {
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--target)
-				PING_TARGETS="$2"; shift 2 ;; 
-			--count)
-				PING_COUNT="$2"; shift 2 ;; 
-			--interval)
-				PING_INTERVAL="$2"; shift 2 ;;
-			--run-once)
-				RUN_MODE="once"; shift ;;
-			*)
-				log "ERROR" "Unknown Argument: $1"
-				exit 2 ;;
-		esac
-	done
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target)
+                PING_TARGETS="$2"; shift 2 ;;
+            --count)
+                PING_COUNT="$2"; shift 2 ;;
+            --interval)
+                PING_INTERVAL="$2"; shift 2 ;;
+            --run-once)
+                RUN_MODE="once"; shift ;;
+            *)
+                log "ERROR" "Unknown argument: $1"
+                exit 2 ;;
+        esac
+    done
 }
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# DATABASE HELPERS
+# ---------------------------------------------------------------------------
+
+# db_exec <sql>
+#   Executes a SQL statement against the configured PostgreSQL instance.
+#   Credentials are passed via PGPASSWORD to avoid interactive prompts.
+db_exec() {
+    local sql="$1"
+    PGPASSWORD="$DB_PASSWORD" psql \
+        --host="$DB_HOST" \
+        --port="$DB_PORT" \
+        --dbname="$DB_NAME" \
+        --username="$DB_USER" \
+        --no-password \
+        --tuples-only \
+        --command="$sql" 2>&1
+}
+
+# verify_db_connection
+#   Runs a lightweight query to confirm connectivity before the main loop.
+verify_db_connection() {
+    log "INFO" "Verifying database connection (${DB_HOST}:${DB_PORT}/${DB_NAME})..."
+    if ! db_exec "SELECT 1;" &>/dev/null; then
+        log "ERROR" "Cannot connect to PostgreSQL. Check DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD."
+        exit 3
+    fi
+    log "INFO" "Database connection OK."
+}
+
+# insert_ping_result <target> <timestamp> <latency_min> <latency_avg> <latency_max> <packet_loss_pct> <probe_count> <status>
+#   Inserts one row into the ping_results table.
+insert_ping_result() {
+    local target="$1"
+    local ts="$2"
+    local lat_min="$3"
+    local lat_avg="$4"
+    local lat_max="$5"
+    local loss="$6"
+    local count="$7"
+    local status="$8"
+
+    local sql="
+        INSERT INTO ping_results
+            (target, probed_at, latency_min_ms, latency_avg_ms, latency_max_ms,
+             packet_loss_pct, probe_count, status)
+        VALUES
+            ('${target}', '${ts}', ${lat_min}, ${lat_avg}, ${lat_max},
+             ${loss}, ${count}, '${status}');
+    "
+    if ! db_exec "$sql" &>/dev/null; then
+        log "WARN" "Failed to insert ping result for target=${target}. Row dropped."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # CORE PROBE LOGIC
-#	probe_target <target>
-#		Sends PING_COUNT ICMP packets to <host>, parses the ping summary line
-#		Returns: latency_min lagency_avg latency_max packet_loss_pct status
-#	
-#	Parsed from ping output lines such as:
-#		"5 packets transmitted, 5 received, 0% packet loss"
-#     	"round-trip min/avg/max/stddev = 12.345/14.567/16.789/1.234 ms"  (macOS/BSD)
-#     	"rtt min/avg/max/mdev = 12.345/14.567/16.789/1.234 ms"           (Linux)
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+# probe_target <host>
+#   Sends PING_COUNT ICMP packets to <host>, parses the ping summary line,
+#   and returns: latency_min latency_avg latency_max packet_loss_pct status
+#
+#   Parsed from ping output lines such as:
+#     "5 packets transmitted, 5 received, 0% packet loss"
+#     "round-trip min/avg/max/stddev = 12.345/14.567/16.789/1.234 ms"  (macOS/BSD)
+#     "rtt min/avg/max/mdev = 12.345/14.567/16.789/1.234 ms"           (Linux)
 probe_target() {
-	local host="$1"
-	local timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    local host="$1"
+    local timestamp
+    timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
     log "INFO" "Probing target: ${host} (count=${PING_COUNT})"
-	
-	# --- Ping ---
-	# Run ping: capture stdout+stderr; do not abort script on ping failure
-	# -c 	count
-	# -W 	timeout
-	# 2>&1 	stderr to stdout
-	# true 	make it true no matter what
-	local raw_output
-	raw_output="$(ping -c "$PING_COUNT" -W 2 "$host" 2>&1)" || true
 
-	# --- Parse packet loss ---
-	local loss
-    loss="$(echo "$raw_output" | grep -oE '[0-9]+(\.[0-9]+)?% packet loss' | grep -oE '[0-9]+(\.[0-9]+)?')"
+    # Run ping; capture stdout+stderr; do not abort script on ping failure
+    local raw_output
+    raw_output="$(ping -c "$PING_COUNT" -W 2 "$host" 2>&1)" || true
+
+    # --- Parse packet loss ---
+    local loss
+    loss="$(echo "$raw_output" \
+        | awk '/packet loss/ { match($0, /([0-9]+(\.[0-9]+)?)% packet loss/, arr); print arr[1] }')"
     loss="${loss:-100}"   # default to 100% if pattern not found (host unreachable)
 
-	# --- Parse RTT statistics ---
+    # --- Parse RTT statistics ---
     # Handles both Linux ("rtt min/avg/max/mdev") and BSD/macOS ("round-trip min/avg/max/stddev")
     local rtt_line
     rtt_line="$(echo "$raw_output" | grep -E 'rtt|round-trip' || true)"
 
-	local lat_min lat_avg lat_max
+    local lat_min lat_avg lat_max
     if [[ -n "$rtt_line" ]]; then
-		lat_min="$(echo "$rtt_line" | awk -F'[=/]' '{print $5}')"
-		lat_avg="$(echo "$rtt_line" | awk -F'[=/]' '{print $6}')"
-		lat_max="$(echo "$rtt_line" | awk -F'[=/]' '{print $7}')"
+        lat_min="$(echo "$rtt_line" | awk -F'[=/]' '{print $5}')"
+        lat_avg="$(echo "$rtt_line" | awk -F'[=/]' '{print $6}')"
+        lat_max="$(echo "$rtt_line" | awk -F'[=/]' '{print $7}')"
     else
         # All packets lost — no RTT line will appear
-		lat_min="0"
+        lat_min="0"
         lat_avg="0"
         lat_max="0"
     fi
 
-	# Sanitize: ensure values are numeric; fall back to 0 if empty/malformed
-	lat_min="${lat_min//[^0-9.]/}"
+    # Sanitise: ensure values are numeric; fall back to 0 if empty/malformed
+    lat_min="${lat_min//[^0-9.]/}"
     lat_avg="${lat_avg//[^0-9.]/}"
     lat_max="${lat_max//[^0-9.]/}"
     lat_min="${lat_min:-0}"
     lat_avg="${lat_avg:-0}"
     lat_max="${lat_max:-0}"
 
-	# --- Determine probe status ---
+    # --- Determine probe status ---
     local status
     if [[ "$loss" == "100" ]]; then
         status="unreachable"
@@ -199,12 +248,12 @@ probe_target() {
         status="ok"
     fi
 
-	log "INFO" "  Result: host=${host} loss=${loss}% rtt=${lat_min}/${lat_avg}/${lat_max}ms status=${status}"
+    log "INFO" "  Result: host=${host} loss=${loss}% rtt=${lat_min}/${lat_avg}/${lat_max}ms status=${status}"
 
-    # insert_ping_result \
-    #     "$host" "$timestamp" \
-    #     "$lat_min" "$lat_avg" "$lat_max" \
-    #     "$loss" "$PING_COUNT" "$status"
+    insert_ping_result \
+        "$host" "$timestamp" \
+        "$lat_min" "$lat_avg" "$lat_max" \
+        "$loss" "$PING_COUNT" "$status"
 }
 
 # run_probe_cycle
@@ -229,13 +278,13 @@ handle_shutdown() {
 
 trap 'handle_shutdown' SIGTERM SIGINT
 
-# ----------------------------------------------------------------------------
-# main
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# ENTRYPOINT
+# ---------------------------------------------------------------------------
 main() {
-	parse_args "$@"
-	check_dependencies
-	# verify_db_connection
+    parse_args "$@"
+    check_dependencies
+    verify_db_connection
 
     if [[ "$RUN_MODE" == "once" ]]; then
         run_probe_cycle
