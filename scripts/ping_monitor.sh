@@ -118,7 +118,7 @@ parse_args() {
 				PING_COUNT="$2"; shift 2 ;; 
 			--interval)
 				PING_INTERVAL="$2"; shift 2 ;;
-			--count)
+			--run-once)
 				RUN_MODE="once"; shift ;;
 			*)
 				log "ERROR" "Unknown Argument: $1"
@@ -183,12 +183,22 @@ probe_target() {
     lat_avg="${lat_avg:-0}"
     lat_max="${lat_max:-0}"
 
+	# --- Determine probe status ---
+    local status
+    if [[ "$loss" == "100" ]]; then
+        status="unreachable"
+    elif (( $(echo "$loss > 0" | awk '{print ($1 > 0)}') )); then
+        status="degraded"
+    else
+        status="ok"
+    fi
+
 	log "INFO" "  Result: host=${host} loss=${loss}% rtt=${lat_min}/${lat_avg}/${lat_max}ms status=${status}"
 
-    insert_ping_result \
-        "$host" "$timestamp" \
-        "$lat_min" "$lat_avg" "$lat_max" \
-        "$loss" "$PING_COUNT" "$status"
+    # insert_ping_result \
+    #     "$host" "$timestamp" \
+    #     "$lat_min" "$lat_avg" "$lat_max" \
+    #     "$loss" "$PING_COUNT" "$status"
 }
 
 # run_probe_cycle
