@@ -36,6 +36,12 @@
 #
 # ===========================================================================
 
+# Immediate fail
+# -e                if any command fails, then exit all script
+# -u                if non-defined variable, exit
+# -o pipefail       if any error during pipelining, exit all pipelines
+set -euo pipefail
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
